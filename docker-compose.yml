@@ -1,0 +1,73 @@
+services:
+  postgres:
+    # Stock Postgres with pgvector pre-built in — see
+    # https://github.com/pgvector/pgvector#docker for the image.
+    # This is the recommended way to run Postgres for local dev and tests;
+    # see README.md / CONTRIBUTING.md.
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: simple_rag
+    ports:
+      # Matches DATABASE_URL's default (postgres://localhost:5432/simple_rag)
+      # in .env.example / src/config.ts — no .env changes needed to use this.
+      - '5432:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  backend:
+    # API server (src/server.ts), built from the root Dockerfile's `dev`
+    # target (hot reload via `tsx watch` — see that Dockerfile and
+    # package.json's dev/migrate:dev scripts). Applies pending migrations
+    # once, then starts watching.
+    build:
+      context: .
+      target: dev
+    env_file: .env
+    environment:
+      # env_file above supplies secrets (OPENAI_API_KEY, etc.) from the
+      # user's own .env; these three are pinned to compose-network values
+      # regardless of what .env has configured for non-Docker local runs.
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/simple_rag
+      ALLOWED_ORIGIN: http://localhost:5173
+      FRONTEND_URL: http://localhost:5173
+    volumes:
+      # Bind-mount source/data over the image's own copies so edits on the
+      # host reach the running container without a rebuild; the anonymous
+      # volume over node_modules keeps the image's own npm-ci'd deps
+      # (tsx included) from being shadowed by the host's — same pattern
+      # the `web` service below already uses for its own hot reload.
+      - ./src:/app/src
+      - ./data:/app/data
+      - /app/node_modules
+    ports:
+      - '3000:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    # Web UI (Vite dev server with hot reload) — see web/Dockerfile.
+    build:
+      context: ./web
+    environment:
+      # Read by the browser-side bundle at dev-server time, so this must be
+      # host-reachable (the code runs in the browser, not the container
+      # network) — not the internal "backend" service name.
+      VITE_API_URL: http://localhost:3000
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+    ports:
+      - '5173:5173'
+    depends_on:
+      - backend
+
+volumes:
+  postgres-data:

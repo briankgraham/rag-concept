@@ -1,0 +1,21 @@
+{
+  "all": true,
+  "src": "dist",
+  "include": ["**/dist/**/*.js"],
+  "exclude": [
+    "**/dist/__tests__/**",
+    "**/dist/server.js",
+    "**/dist/cli/**",
+    "**/dist/db/migrate.js",
+    "**/dist/eval/**",
+    "**/dist/**/*.interface.js",
+    "**/dist/orchestrator/types.js"
+  ],
+  "reporter": ["text", "html", "lcov"],
+  "reportsDirectory": "coverage",
+  "checkCoverage": true,
+  "lines": 100,
+  "functions": 100,
+  "branches": 100,
+  "statements": 100
+}
