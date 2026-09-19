@@ -15,6 +15,12 @@ services:
       - '5432:5432'
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      # Creates the second `simple_rag_test` database `npm test` uses (see
+      # package.json) on first init, alongside POSTGRES_DB above — keeps
+      # the test suite's TRUNCATEs/rollback tests off the same database
+      # `docker compose up -d`'s backend/web actually serve from. See that
+      # file's own header comment for what to do with an existing volume.
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U postgres']
       interval: 2s

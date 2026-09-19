@@ -1,0 +1,18 @@
+-- Runs once, automatically, only when the postgres container initializes a
+-- brand-new data volume (see docker-entrypoint-initdb.d in the postgres
+-- image's entrypoint, and docker-compose.yml's postgres service, which
+-- mounts this directory in). POSTGRES_DB (simple_rag) is created by the
+-- image itself before these scripts run; this adds the second database
+-- `npm test` uses (see package.json's test/test:coverage scripts), so the
+-- test suite's TRUNCATEs and deliberately-malformed rows (e.g.
+-- embeddings-service.test.ts's dimension-mismatch rollback test) can never
+-- land in the same database `docker compose up -d`'s backend/web serve
+-- from — see CONTRIBUTING.md's Testing & coverage section.
+--
+-- An EXISTING volume (created before this file was added) will NOT re-run
+-- this automatically — Postgres only executes docker-entrypoint-initdb.d
+-- scripts on first init. Create it manually once in that case:
+--   docker compose exec postgres psql -U postgres -c 'CREATE DATABASE simple_rag_test;'
+-- then apply migrations to it (see the "test" npm script, which does this
+-- itself on every run).
+CREATE DATABASE simple_rag_test;

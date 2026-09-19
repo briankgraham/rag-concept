@@ -1,10 +1,10 @@
 /**
  * Shared test doubles for orchestrator/tool tests. Keeping these in one
  * place means a new tool's test file doesn't need to reinvent a fake user
- * or a scripted OpenAI client — see src/__tests__/orchestrator.test.ts for
+ * or a scripted chat provider — see src/__tests__/orchestrator.test.ts for
  * the pattern.
  */
-import type OpenAI from 'openai';
+import type { AssistantMessage, ChatProvider } from '../providers/chat-provider.interface.js';
 import type { RagService } from '../rag/rag.service.js';
 import type { PtoService } from '../hr/pto.service.js';
 import type { ToolContext } from '../orchestrator/types.js';
@@ -19,39 +19,41 @@ export const fakeUser: User = {
   employeeId: 'E1001'
 };
 
-export function toolCallMessage(id: string, name: string, args: unknown) {
-  return {
-    role: 'assistant' as const,
-    content: null,
-    tool_calls: [{ id, type: 'function' as const, function: { name, arguments: JSON.stringify(args) } }]
-  };
+export function toolCallMessage(id: string, name: string, args: unknown): AssistantMessage {
+  return { role: 'assistant', content: null, toolCalls: [{ id, name, arguments: JSON.stringify(args) }] };
 }
 
-export function finalMessage(content: string) {
-  return { role: 'assistant' as const, content, tool_calls: undefined };
+export function finalMessage(content: string): AssistantMessage {
+  return { role: 'assistant', content };
 }
 
 /**
- * Fake OpenAI client that returns a scripted sequence of chat completion
- * messages. `onRequest`, when given, is called with each raw request body
- * passed to `create()` — lets a test assert on what messages (e.g. prior
- * conversation history) the orchestrator actually sent, without every
- * other scriptedOpenAI caller needing to care.
+ * Fake ChatProvider that returns a scripted sequence of assistant messages
+ * (from both complete() and completeWithTools()). `onRequest`, when given,
+ * is called with `{ messages, tools }` for each call — lets a test assert
+ * on what messages (e.g. prior conversation history) the orchestrator
+ * actually sent, without every other caller needing to care.
  */
-export function scriptedOpenAI(messages: unknown[], onRequest?: (request: any) => void): OpenAI {
+export function scriptedChat(
+  messages: AssistantMessage[],
+  onRequest?: (request: { messages: unknown[]; tools?: unknown[] }) => void
+): ChatProvider {
   let call = 0;
+  const next = (): AssistantMessage => {
+    const message = messages[Math.min(call, messages.length - 1)];
+    call++;
+    return message;
+  };
   return {
-    chat: {
-      completions: {
-        create: (request: unknown) => {
-          onRequest?.(request);
-          const message = messages[Math.min(call, messages.length - 1)];
-          call++;
-          return Promise.resolve({ choices: [{ message }] });
-        }
-      }
+    complete: (requestMessages) => {
+      onRequest?.({ messages: requestMessages });
+      return Promise.resolve({ content: next().content ?? '', model: 'fake-model' });
+    },
+    completeWithTools: (requestMessages, tools) => {
+      onRequest?.({ messages: requestMessages, tools });
+      return Promise.resolve({ message: next(), model: 'fake-model' });
     }
-  } as unknown as OpenAI;
+  };
 }
 
 export const fakePtoBalance: PtoBalance = {
@@ -67,12 +69,12 @@ function defaultFakePtoService(): Partial<PtoService> {
 }
 
 export function fakeToolContext(
-  openai: OpenAI,
+  chat: ChatProvider,
   overrides: { ragService?: Partial<RagService>; ptoService?: Partial<PtoService>; debug?: boolean } = {}
 ): ToolContext {
   return {
     user: fakeUser,
-    openai,
+    chat,
     ragService: (overrides.ragService ?? {}) as RagService,
     ptoService: (overrides.ptoService ?? defaultFakePtoService()) as PtoService,
     debug: overrides.debug ?? false

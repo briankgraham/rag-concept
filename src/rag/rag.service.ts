@@ -1,4 +1,4 @@
-import OpenAI from 'openai';
+import type { ChatProvider } from '../providers/chat-provider.interface.js';
 import { EmbeddingsService, type Chunk } from './embeddings.service.js';
 import { chatCompletion } from './llm.js';
 
@@ -18,14 +18,14 @@ const SYSTEM_ANSWER = `Answer the question strictly based on the provided contex
  */
 export class RagService {
   constructor(
-    private openai: OpenAI,
+    private chat: ChatProvider,
     private embeddingsService: EmbeddingsService,
     private debug: boolean = false
   ) {}
 
   async proposeSearchQueries(question: string): Promise<string[]> {
     const raw = await chatCompletion(
-      this.openai,
+      this.chat,
       [
         { role: 'system', content: SYSTEM_QUERY_GEN },
         { role: 'user', content: question }
@@ -55,6 +55,11 @@ export class RagService {
     return chunks.map((chunk) => `### Source: ${chunk.source}\n${chunk.content}`).join('\n');
   }
 
+  /** Distinct source documents across a set of chunks, sorted for a deterministic order. */
+  private distinctSources(chunks: Chunk[]): string[] {
+    return [...new Set(chunks.map((c) => c.source))].sort();
+  }
+
   /**
    * Search the docs corpus with one or more queries and return the
    * assembled context text. Used by the orchestrator's search_company_docs
@@ -69,10 +74,10 @@ export class RagService {
     // chunks (all matched across the sub-queries) previously inflated this
     // count, overstating how many different documents corroborate the
     // answer to the model consuming this tool result. `sources` is that
-    // same distinct set, sorted for a deterministic order, surfaced so a
-    // caller (the orchestrator, then chat.service.ts) can cite exactly
-    // which doc(s) an answer drew from instead of just a count.
-    const sources = [...new Set(chunks.map((c) => c.source))].sort();
+    // same distinct set, surfaced so a caller (the orchestrator, then
+    // chat.service.ts) can cite exactly which doc(s) an answer drew from
+    // instead of just a count.
+    const sources = this.distinctSources(chunks);
     return { context: this.buildContext(chunks), sourceCount: sources.length, sources };
   }
 
@@ -86,10 +91,10 @@ export class RagService {
     if (this.debug) console.log(`[DEBUG] Found ${chunks.length} chunks`);
 
     const context = this.buildContext(chunks);
-    const sources = [...new Set(chunks.map((c) => c.source))].sort();
+    const sources = this.distinctSources(chunks);
 
     const answer = await chatCompletion(
-      this.openai,
+      this.chat,
       [
         { role: 'system', content: SYSTEM_ANSWER },
         { role: 'system', content: `Context:\n${context}` },

@@ -1,13 +1,9 @@
-import type OpenAI from 'openai';
 import { TOOLS, findTool } from './tools/index.js';
 import type { ToolContext } from './types.js';
 import { HttpError } from '../middleware/error-handler.js';
 import type { ConversationMessage } from '../chat/conversation.repo.js';
+import type { ChatMessage, ToolSpec } from '../providers/chat-provider.interface.js';
 
-type ChatCompletionMessageParam = OpenAI.ChatCompletionMessageParam;
-type ChatCompletionTool = OpenAI.ChatCompletionTool;
-
-const MODEL = 'gpt-5';
 const MAX_TOOL_TURNS = 4;
 
 const SYSTEM_PROMPT = `You are the internal assistant for a company's employees, answering questions via tools rather than from your own knowledge.
@@ -40,14 +36,11 @@ export interface OrchestratorResult {
   retrievedSources: string[];
 }
 
-function toOpenAiTools(): ChatCompletionTool[] {
+function toToolSpecs(): ToolSpec[] {
   return TOOLS.map((tool) => ({
-    type: 'function',
-    function: {
-      name: tool.name,
-      description: tool.description,
-      parameters: tool.parameters
-    }
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.parameters
   }));
 }
 
@@ -74,37 +67,30 @@ export async function runOrchestrator(
   history: ConversationMessage[] = []
 ): Promise<OrchestratorResult> {
   const start = Date.now();
-  const messages: ChatCompletionMessageParam[] = [
+  const messages: ChatMessage[] = [
     { role: 'system', content: SYSTEM_PROMPT },
-    ...history.map((m): ChatCompletionMessageParam => ({ role: m.role, content: m.content })),
+    ...history.map((m): ChatMessage => ({ role: m.role, content: m.content })),
     { role: 'user', content: question }
   ];
   const toolCalls: ToolCallRecord[] = [];
   const attemptedToolNames: string[] = [];
   const retrievedSourcesSet = new Set<string>();
-  const tools = toOpenAiTools();
+  const tools = toToolSpecs();
 
   for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
     if (ctx.debug) {
       console.log(`\n[DEBUG] Orchestrator turn ${turn + 1} request:`);
-      console.log(JSON.stringify({ model: MODEL, messages, tools }, null, 2));
+      console.log(JSON.stringify({ messages, tools }, null, 2));
     }
 
-    const response = await ctx.openai.chat.completions.create({
-      model: MODEL,
-      messages,
-      tools,
-      tool_choice: 'auto'
-    });
-
-    const message = response.choices[0].message;
+    const { message } = await ctx.chat.completeWithTools(messages, tools);
     messages.push(message);
 
     if (ctx.debug) {
       console.log('[DEBUG] Orchestrator turn response:', JSON.stringify(message, null, 2));
     }
 
-    if (!message.tool_calls || message.tool_calls.length === 0) {
+    if (!message.toolCalls || message.toolCalls.length === 0) {
       const retrievedSources = [...retrievedSourcesSet].sort();
       // Always-on, one-line per-request summary — the /chat request-level
       // ms from request-logger.ts doesn't break down tool/turn count, and
@@ -116,32 +102,52 @@ export async function runOrchestrator(
       return { answer: message.content ?? '', toolCalls, attemptedToolNames, retrievedSources };
     }
 
-    for (const call of message.tool_calls) {
-      const tool = findTool(call.function.name);
-      let resultPayload: Record<string, unknown>;
+    // Execute every tool call this turn concurrently — they're independent
+    // reads with no ordering dependency between them (see orchestrator.ts's
+    // plan doc / commit message) — then apply results in the original call
+    // order, not completion order, so toolCalls/attemptedToolNames/the
+    // pushed tool messages stay deterministic regardless of which call
+    // actually finishes first.
+    const outcomes = await Promise.all(
+      message.toolCalls.map(async (call) => {
+        const tool = findTool(call.name);
 
-      if (!tool) {
-        resultPayload = { error: `Unknown tool: ${call.function.name}` };
-      } else {
-        attemptedToolNames.push(tool.name);
+        if (!tool) {
+          return { call, success: false as const, resultPayload: { error: `Unknown tool: ${call.name}` } };
+        }
+
         try {
-          const rawArgs = call.function.arguments ? JSON.parse(call.function.arguments) : {};
+          const rawArgs = call.arguments ? JSON.parse(call.arguments) : {};
           const args = tool.argsSchema.parse(rawArgs);
           const result = await tool.execute(args, ctx);
-          toolCalls.push({ name: tool.name, args });
-          result.sourcesUsed?.forEach((source) => retrievedSourcesSet.add(source));
-          resultPayload = result.preferredAnswer
+          const resultPayload = result.preferredAnswer
             ? { ...result.content, preferredAnswer: result.preferredAnswer }
             : result.content;
+          return { call, tool, success: true as const, args, resultPayload, sourcesUsed: result.sourcesUsed };
         } catch (err) {
-          resultPayload = { error: err instanceof Error ? err.message : String(err) };
+          return {
+            call,
+            tool,
+            success: false as const,
+            resultPayload: { error: err instanceof Error ? err.message : String(err) }
+          };
+        }
+      })
+    );
+
+    for (const outcome of outcomes) {
+      if (outcome.tool) {
+        attemptedToolNames.push(outcome.tool.name);
+        if (outcome.success) {
+          toolCalls.push({ name: outcome.tool.name, args: outcome.args });
+          outcome.sourcesUsed?.forEach((source) => retrievedSourcesSet.add(source));
         }
       }
 
       messages.push({
         role: 'tool',
-        tool_call_id: call.id,
-        content: JSON.stringify(resultPayload)
+        toolCallId: outcome.call.id,
+        content: JSON.stringify(outcome.resultPayload)
       });
     }
   }

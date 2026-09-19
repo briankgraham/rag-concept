@@ -1,4 +1,4 @@
-import OpenAI from 'openai';
+import type { ChatProvider } from '../providers/chat-provider.interface.js';
 import { RagService } from '../rag/rag.service.js';
 import { PtoService } from '../hr/pto.service.js';
 import { runOrchestrator } from '../orchestrator/orchestrator.js';
@@ -19,7 +19,7 @@ export interface ChatAnswer {
 
 /** The services answerChatMessage needs — one options object, same shape used by createChatRouter. */
 export interface ChatDeps {
-  openai: OpenAI;
+  chat: ChatProvider;
   ragService: RagService;
   ptoService: PtoService;
   debug: boolean;

@@ -13,7 +13,7 @@ import { pool } from '../db/pool.js';
 import { errorHandler } from '../middleware/error-handler.js';
 import type { RagService } from '../rag/rag.service.js';
 import type { PtoService } from '../hr/pto.service.js';
-import { scriptedOpenAI, toolCallMessage, finalMessage, fakePtoBalance } from './test-helpers.js';
+import { scriptedChat, toolCallMessage, finalMessage, fakePtoBalance } from './test-helpers.js';
 
 after(async () => {
   await pool.end();
@@ -49,11 +49,11 @@ async function withServer(
   }
 }
 
-function testDeps(openai = scriptedOpenAI([finalMessage('hi')])): ChatDeps {
+function testDeps(chat = scriptedChat([finalMessage('hi')])): ChatDeps {
   const ragService: Partial<RagService> = {};
   const ptoService: Partial<PtoService> = {};
   return {
-    openai,
+    chat,
     ragService: ragService as RagService,
     ptoService: ptoService as PtoService,
     debug: false
@@ -61,12 +61,12 @@ function testDeps(openai = scriptedOpenAI([finalMessage('hi')])): ChatDeps {
 }
 
 test('POST /api/chat returns an answer for an authenticated user', async () => {
-  const openai = scriptedOpenAI([
+  const chat = scriptedChat([
     toolCallMessage('call_1', 'get_pto_balance', {}),
     finalMessage('You have 10 days left.')
   ]);
   const ptoService: Partial<PtoService> = { getBalanceForEmployee: () => Promise.resolve(fakePtoBalance) };
-  const deps: ChatDeps = { ...testDeps(openai), ptoService: ptoService as PtoService };
+  const deps: ChatDeps = { ...testDeps(chat), ptoService: ptoService as PtoService };
 
   await withServer(deps, async (baseUrl, cookie) => {
     const res = await fetch(`${baseUrl}/api/chat`, {

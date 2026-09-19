@@ -1,42 +1,29 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import type OpenAI from 'openai';
+import type { ChatProvider } from '../providers/chat-provider.interface.js';
 import { chatCompletion } from '../rag/llm.js';
 
-function fakeOpenAI(content: string, capturedModel: { value?: string } = {}): OpenAI {
+function fakeChat(content: string | null, captured: { model?: string } = {}): ChatProvider {
   return {
-    chat: {
-      completions: {
-        create: (params: { model: string }) => {
-          capturedModel.value = params.model;
-          return Promise.resolve({ choices: [{ message: { content } }] });
-        }
-      }
-    }
-  } as unknown as OpenAI;
+    complete: (_messages, options) => {
+      captured.model = options?.model;
+      return Promise.resolve({ content: content ?? '', model: options?.model ?? 'default-model' });
+    },
+    completeWithTools: () => Promise.reject(new Error('not used'))
+  };
 }
 
-test('chatCompletion returns the message content using the default model', async () => {
-  const captured: { value?: string } = {};
-  const openai = fakeOpenAI('hello', captured);
-  const result = await chatCompletion(openai, [{ role: 'user', content: 'hi' }]);
+test('chatCompletion returns the message content and lets the provider choose the default model', async () => {
+  const captured: { model?: string } = {};
+  const result = await chatCompletion(fakeChat('hello', captured), [{ role: 'user', content: 'hi' }]);
   assert.equal(result, 'hello');
-  assert.equal(captured.value, 'gpt-5');
+  assert.equal(captured.model, undefined);
 });
 
-test('chatCompletion honors a custom model option', async () => {
-  const captured: { value?: string } = {};
-  const openai = fakeOpenAI('hi', captured);
-  await chatCompletion(openai, [{ role: 'user', content: 'hi' }], { model: 'gpt-4o' });
-  assert.equal(captured.value, 'gpt-4o');
-});
-
-test('chatCompletion falls back to an empty string when content is null', async () => {
-  const openai = {
-    chat: { completions: { create: () => Promise.resolve({ choices: [{ message: { content: null } }] }) } }
-  } as unknown as OpenAI;
-  const result = await chatCompletion(openai, [{ role: 'user', content: 'hi' }]);
-  assert.equal(result, '');
+test('chatCompletion forwards a custom model option to the provider', async () => {
+  const captured: { model?: string } = {};
+  await chatCompletion(fakeChat('hi', captured), [{ role: 'user', content: 'hi' }], { model: 'gpt-4o' });
+  assert.equal(captured.model, 'gpt-4o');
 });
 
 test('chatCompletion logs request/response when debug is true', async () => {
@@ -44,8 +31,7 @@ test('chatCompletion logs request/response when debug is true', async () => {
   const originalLog = console.log;
   console.log = (msg: string) => logged.push(msg);
   try {
-    const openai = fakeOpenAI('debug-response');
-    await chatCompletion(openai, [{ role: 'user', content: 'hi' }], { debug: true });
+    await chatCompletion(fakeChat('debug-response'), [{ role: 'user', content: 'hi' }], { debug: true });
   } finally {
     console.log = originalLog;
   }

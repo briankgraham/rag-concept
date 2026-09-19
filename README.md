@@ -38,7 +38,7 @@ The web app, the CLI, the eval script, and most of the test suite all need a rea
 docker compose up -d
 ```
 
-If you'd rather use a Postgres you already run yourself, make sure the `vector` extension is installed for it (e.g. `brew install pgvector` on macOS) — `CREATE EXTENSION IF NOT EXISTS vector` (run automatically by `npm run migrate`) still requires the extension files to be present on disk.
+If you'd rather use a Postgres you already run yourself, make sure the `vector` extension is installed for it (e.g. `brew install pgvector` on macOS) — `CREATE EXTENSION IF NOT EXISTS vector` (run automatically by `npm run migrate`) still requires the extension files to be present on disk. Either way, also create a `simple_rag_test` database alongside `simple_rag` (`docker-compose.yml` does this for you on a fresh volume; `createdb simple_rag_test` for your own Postgres) — `npm test` runs against it exclusively, see [Testing](#testing) below.
 
 ## Run everything with Docker Compose
 
@@ -160,7 +160,7 @@ npm run test:coverage # run it with coverage enforced at 100% (lines/branches/fu
 npm run eval:tools    # live tool-selection eval against the real OpenAI API (needs OPENAI_API_KEY and a reachable DB)
 ```
 
-Requires a local Postgres with pgvector reachable at `DATABASE_URL` (default matches `docker compose up -d` — see [Local Postgres](#local-postgres) above) with migrations applied (`npm run migrate`) — most of the suite mocks its dependencies (OpenAI, Okta, ADP), but the auth/session/PTO-cache/embeddings tests intentionally exercise the real database rather than a fake, including full login-flow tests against real HTTP servers on ephemeral ports.
+Requires a local Postgres with pgvector reachable (default matches `docker compose up -d` — see [Local Postgres](#local-postgres) above) — most of the suite mocks its dependencies (OpenAI, Okta, ADP), but the auth/session/PTO-cache/embeddings tests intentionally exercise the real database rather than a fake, including full login-flow tests against real HTTP servers on ephemeral ports. `npm test`/`npm run test:coverage` run against a separate `simple_rag_test` database (pinned in `package.json`, migrated automatically) — never the `simple_rag` database your dev stack's own embeddings cache lives in. See [CONTRIBUTING.md](./CONTRIBUTING.md#testing--coverage) if that database doesn't exist yet on an existing Postgres volume.
 
 Coverage is enforced, not aspirational — see [CONTRIBUTING.md](./CONTRIBUTING.md#testing--coverage) for exactly what's excluded (bootstrap/entrypoint scripts and type-only files) and why, plus two non-obvious gotchas in the `c8` config if you need to touch it. `coverage/` is gitignored.
 

@@ -20,14 +20,13 @@
 import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
-import OpenAI from 'openai';
+import { createProviders } from '../providers/openai/create-providers.js';
 import { pool } from '../db/pool.js';
 import { EmbeddingsService } from '../rag/embeddings.service.js';
 import { RagService } from '../rag/rag.service.js';
 
 const DOCS_DIR = path.resolve('data', 'company-data');
 
-let openai: OpenAI;
 let embeddingsService: EmbeddingsService;
 let ragService: RagService;
 let debug = false;
@@ -151,41 +150,37 @@ async function promptForAPIKey(): Promise<string> {
 }
 
 async function addFile(filePath: string): Promise<void> {
-  // Validate file exists
   if (!fs.existsSync(filePath)) {
     console.error(`Error: File not found: ${filePath}`);
     process.exit(1);
   }
 
-  // Validate it's a file, not a directory
   const stats = fs.statSync(filePath);
   if (!stats.isFile()) {
     console.error(`Error: ${filePath} is not a file`);
     process.exit(1);
   }
 
-  // Validate it's a markdown file
+  // Only markdown is chunked/embedded (see EmbeddingsService.walkFiles's
+  // '.md' filter) — accepting anything else here would silently add a file
+  // that rebuildCache() then never picks up.
   if (!filePath.endsWith('.md')) {
     console.error('Error: Only .md (markdown) files are supported');
     process.exit(1);
   }
 
-  // Create destination path
   const fileName = path.basename(filePath);
   const destPath = path.join(DOCS_DIR, fileName);
 
-  // Check if file already exists
   if (fs.existsSync(destPath)) {
     console.error(`Error: File ${fileName} already exists in ${DOCS_DIR}`);
     process.exit(1);
   }
 
-  // Copy file to company data directory
   console.log(`Adding ${fileName} to knowledge base...`);
   fs.copyFileSync(filePath, destPath);
   console.log(`✓ File copied to ${destPath}`);
 
-  // Rebuild embeddings cache
   console.log('Rebuilding embeddings cache...');
   await embeddingsService.rebuildCache();
 
@@ -205,8 +200,8 @@ async function addFile(filePath: string): Promise<void> {
     }
   }
 
-  openai = new OpenAI({ apiKey });
-  embeddingsService = new EmbeddingsService(openai, DOCS_DIR, pool);
+  const providers = createProviders(apiKey);
+  embeddingsService = new EmbeddingsService(providers.embeddings, DOCS_DIR, pool);
 
   // Parse command line arguments
   const args = process.argv.slice(2);
@@ -214,7 +209,7 @@ async function addFile(filePath: string): Promise<void> {
   const filteredArgs = args.filter((a) => a !== '--debug');
   const cmd = filteredArgs[0];
 
-  ragService = new RagService(openai, embeddingsService, debug);
+  ragService = new RagService(providers.chat, embeddingsService, debug);
 
   if (cmd === 'train') {
     console.log('Rebuilding embeddings cache...');

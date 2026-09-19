@@ -4,7 +4,7 @@ import { answerChatMessage, type ChatDeps } from '../chat/chat.service.js';
 import { getRecentMessages } from '../chat/conversation.repo.js';
 import type { RagService } from '../rag/rag.service.js';
 import type { PtoService } from '../hr/pto.service.js';
-import { toolCallMessage, finalMessage, scriptedOpenAI, fakePtoBalance } from './test-helpers.js';
+import { toolCallMessage, finalMessage, scriptedChat, fakePtoBalance } from './test-helpers.js';
 import { findOrCreateUser } from '../auth/users.repo.js';
 import { pool } from '../db/pool.js';
 import { formatPtoAnswer } from '../hr/format.js';
@@ -26,10 +26,10 @@ async function makeTestUser() {
   });
 }
 
-function deps(openai: ReturnType<typeof scriptedOpenAI>, ragService: Partial<RagService> = {}): ChatDeps {
+function deps(chat: ReturnType<typeof scriptedChat>, ragService: Partial<RagService> = {}): ChatDeps {
   const ptoService: Partial<PtoService> = { getBalanceForEmployee: () => Promise.resolve(fakePtoBalance) };
   return {
-    openai,
+    chat,
     ragService: ragService as RagService,
     ptoService: ptoService as PtoService,
     debug: false
@@ -38,18 +38,18 @@ function deps(openai: ReturnType<typeof scriptedOpenAI>, ragService: Partial<Rag
 
 test('answerChatMessage labels a PTO-tool answer as pto_lookup', async () => {
   const user = await makeTestUser();
-  const openai = scriptedOpenAI([
+  const chat = scriptedChat([
     toolCallMessage('call_1', 'get_pto_balance', {}),
     finalMessage(formatPtoAnswer(fakePtoBalance))
   ]);
 
-  const result = await answerChatMessage(deps(openai), user, 'how many pto days do i have left');
+  const result = await answerChatMessage(deps(chat), user, 'how many pto days do i have left');
   assert.equal(result.source, 'pto_lookup');
 });
 
 test('answerChatMessage labels a docs-search answer as rag', async () => {
   const user = await makeTestUser();
-  const openai = scriptedOpenAI([
+  const chat = scriptedChat([
     toolCallMessage('call_1', 'search_company_docs', { queries: ['remote work'] }),
     finalMessage('Employees may work remotely up to 3 days a week.')
   ]);
@@ -59,7 +59,7 @@ test('answerChatMessage labels a docs-search answer as rag', async () => {
   };
 
   const result = await answerChatMessage(
-    deps(openai, ragService),
+    deps(chat, ragService),
     user,
     'what is the remote work policy'
   );
@@ -72,9 +72,9 @@ test('answerChatMessage labels a docs-search answer as rag', async () => {
 
 test('answerChatMessage labels a no-tool answer as direct', async () => {
   const user = await makeTestUser();
-  const openai = scriptedOpenAI([finalMessage('Hi! How can I help?')]);
+  const chat = scriptedChat([finalMessage('Hi! How can I help?')]);
 
-  const result = await answerChatMessage(deps(openai), user, 'hello');
+  const result = await answerChatMessage(deps(chat), user, 'hello');
   assert.equal(result.source, 'direct');
   assert.deepEqual(result.sources, []); // no search_company_docs call -> no citations
 });
@@ -85,7 +85,7 @@ test('answerChatMessage labels a FAILED PTO lookup as pto_lookup, not direct', a
   // genuinely a personal-data-lookup attempt — mislabeling it 'direct'
   // would make analytics/QA blind to failed personal-data paths.
   const user = await makeTestUser();
-  const openai = scriptedOpenAI([
+  const chat = scriptedChat([
     toolCallMessage('call_1', 'get_pto_balance', {}),
     finalMessage("Sorry, I couldn't look that up right now.")
   ]);
@@ -94,7 +94,7 @@ test('answerChatMessage labels a FAILED PTO lookup as pto_lookup, not direct', a
   };
 
   const result = await answerChatMessage(
-    { openai, ragService: {} as RagService, ptoService: ptoService as PtoService, debug: false },
+    { chat, ragService: {} as RagService, ptoService: ptoService as PtoService, debug: false },
     user,
     'how many pto days do i have left'
   );
@@ -103,17 +103,13 @@ test('answerChatMessage labels a FAILED PTO lookup as pto_lookup, not direct', a
 
 test('answerChatMessage prefers pto_lookup over rag when both tools are called (personal data takes precedence)', async () => {
   const user = await makeTestUser();
-  const openai = scriptedOpenAI([
+  const chat = scriptedChat([
     {
       role: 'assistant' as const,
       content: null,
-      tool_calls: [
-        { id: 'c1', type: 'function' as const, function: { name: 'get_pto_balance', arguments: '{}' } },
-        {
-          id: 'c2',
-          type: 'function' as const,
-          function: { name: 'search_company_docs', arguments: JSON.stringify({ queries: ['pto policy'] }) }
-        }
+      toolCalls: [
+        { id: 'c1', name: 'get_pto_balance', arguments: '{}' },
+        { id: 'c2', name: 'search_company_docs', arguments: JSON.stringify({ queries: ['pto policy'] }) }
       ]
     },
     finalMessage('You have 10 days left, and the general policy is 20 days per year.')
@@ -123,7 +119,7 @@ test('answerChatMessage prefers pto_lookup over rag when both tools are called (
       Promise.resolve({ context: '...', sourceCount: 1, sources: ['data/company-data/01_company_handbook.md'] })
   };
 
-  const result = await answerChatMessage(deps(openai, ragService), user, 'my pto and the policy');
+  const result = await answerChatMessage(deps(chat, ragService), user, 'my pto and the policy');
   assert.equal(result.source, 'pto_lookup');
   // Source labeling prefers pto_lookup, but citations still surface both
   // tools' actual contributions — labeling and citation are separate
@@ -134,16 +130,16 @@ test('answerChatMessage prefers pto_lookup over rag when both tools are called (
 test('answerChatMessage persists the question and answer, and feeds prior turns back in as history', async () => {
   const user = await makeTestUser();
 
-  const firstOpenai = scriptedOpenAI([finalMessage('Can you tell me what you mean by allocation?')]);
-  await answerChatMessage(deps(firstOpenai), user, 'company pto allocation');
+  const firstChat = scriptedChat([finalMessage('Can you tell me what you mean by allocation?')]);
+  await answerChatMessage(deps(firstChat), user, 'company pto allocation');
 
   let capturedMessages: Array<{ role: string; content: unknown }> = [];
-  const secondOpenai = scriptedOpenAI([finalMessage('You get 20 days per year.')], (request) => {
+  const secondChat = scriptedChat([finalMessage('You get 20 days per year.')], (request) => {
     // Copy, not just reference — orchestrator.ts mutates this array in
     // place after the call returns.
     capturedMessages = [...(request as { messages: Array<{ role: string; content: unknown }> }).messages];
   });
-  const result = await answerChatMessage(deps(secondOpenai), user, 'i mean my own balance');
+  const result = await answerChatMessage(deps(secondChat), user, 'i mean my own balance');
 
   assert.equal(result.answer, 'You get 20 days per year.');
   // The second call's request to the LLM includes the first exchange as

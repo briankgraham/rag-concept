@@ -2,14 +2,21 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import type { Pool } from 'pg';
-import pgvector from 'pgvector';
-import OpenAI from 'openai';
+import type { EmbeddingsProvider } from '../providers/embeddings-provider.interface.js';
 // cl100k_base is the encoding OpenAI's text-embedding-3-small (and -large,
 // and gpt-3.5/4) actually tokenizes with — chunking by token count instead
 // of raw character count keeps CHUNK_SIZE meaningful across unicode-heavy
 // or markdown-table-heavy docs, where character count is a poor proxy for
 // what the embedding model actually sees.
 import { encode, decode } from 'gpt-tokenizer/encoding/cl100k_base';
+import {
+  getChunkCount,
+  getSourceHashMap,
+  upsertSourceChunks,
+  deleteSource,
+  vectorSearch,
+  keywordSearchRows
+} from './docs.repo.js';
 
 const CHUNK_SIZE = 400; // tokens, not characters — see chunkText()
 
@@ -58,15 +65,22 @@ interface SearchResult {
  * src/db/migrations/004_create_rag_tables.sql) via pgvector, not in an
  * in-process cache or a JSON file. rebuildCache() is incremental: it only
  * re-embeds files whose content actually changed since the last rebuild.
+ *
+ * All raw SQL/transaction logic against doc_sources/doc_chunks lives in
+ * ./docs.repo.ts, not here — this class stays responsible for chunking,
+ * calling its EmbeddingsProvider, and RRF fusion, and passes its constructor-injected pool
+ * straight through to docs.repo.ts's functions rather than importing
+ * db/pool.ts's singleton query() helper (see CONTRIBUTING.md's DB-exception
+ * note on why EmbeddingsService takes a Pool explicitly in the first place).
  */
 export class EmbeddingsService {
   private docsDir: string;
-  private openai: OpenAI;
+  private embeddings: EmbeddingsProvider;
   private pool: Pool;
   private initialized = false;
 
-  constructor(openai: OpenAI, docsDir: string, pool: Pool) {
-    this.openai = openai;
+  constructor(embeddings: EmbeddingsProvider, docsDir: string, pool: Pool) {
+    this.embeddings = embeddings;
     this.docsDir = docsDir;
     this.pool = pool;
   }
@@ -79,8 +93,8 @@ export class EmbeddingsService {
    * checks (read-only) whether that trust is actually still warranted.
    */
   async initialize(): Promise<void> {
-    const result = await this.pool.query<{ count: string }>('SELECT count(*) FROM doc_chunks');
-    if (Number(result.rows[0].count) === 0) {
+    const chunkCount = await getChunkCount(this.pool);
+    if (chunkCount === 0) {
       await this.rebuildCache();
     } else {
       await this.warnIfStale();
@@ -104,10 +118,7 @@ export class EmbeddingsService {
     const files = this.docsDirExists() ? this.walkFiles(this.docsDir, '.md') : [];
     const sources = new Map(files.map((file) => [path.relative('.', file), file]));
 
-    const existing = await this.pool.query<{ source: string; content_hash: string }>(
-      'SELECT source, content_hash FROM doc_sources'
-    );
-    const existingHashes = new Map(existing.rows.map((r) => [r.source, r.content_hash]));
+    const existingHashes = await getSourceHashMap(this.pool);
 
     const changed: string[] = [];
     const added: string[] = [];
@@ -195,34 +206,15 @@ export class EmbeddingsService {
 
   /**
    * Re-embed and upsert one changed (or new) source file's chunks,
-   * replacing whatever chunks it had before.
+   * replacing whatever chunks it had before. Chunking/embedding is this
+   * class's responsibility; the actual transactional write is
+   * docs.repo.ts's (see upsertSourceChunks() there for the rollback
+   * behavior on a partial failure).
    */
   private async upsertSource(source: string, content: string, hash: string): Promise<void> {
     const chunkTexts = this.chunkText(content);
     const embeddings = await this.embedTexts(chunkTexts);
-
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query(
-        `INSERT INTO doc_sources (source, content_hash, updated_at) VALUES ($1, $2, now())
-         ON CONFLICT (source) DO UPDATE SET content_hash = $2, updated_at = now()`,
-        [source, hash]
-      );
-      await client.query('DELETE FROM doc_chunks WHERE source = $1', [source]);
-      for (let i = 0; i < chunkTexts.length; i++) {
-        await client.query(
-          `INSERT INTO doc_chunks (source, chunk_index, content, embedding) VALUES ($1, $2, $3, $4)`,
-          [source, i, chunkTexts[i], pgvector.toSql(embeddings[i])]
-        );
-      }
-      await client.query('COMMIT');
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+    await upsertSourceChunks(this.pool, source, hash, chunkTexts, embeddings);
   }
 
   /**
@@ -235,10 +227,7 @@ export class EmbeddingsService {
     const files = this.docsDirExists() ? this.walkFiles(this.docsDir, '.md') : [];
     const sources = new Map(files.map((file) => [path.relative('.', file), file]));
 
-    const existing = await this.pool.query<{ source: string; content_hash: string }>(
-      'SELECT source, content_hash FROM doc_sources'
-    );
-    const existingHashes = new Map(existing.rows.map((r) => [r.source, r.content_hash]));
+    const existingHashes = await getSourceHashMap(this.pool);
 
     for (const [source, file] of sources) {
       const content = fs.readFileSync(file, 'utf8');
@@ -249,7 +238,7 @@ export class EmbeddingsService {
 
     for (const source of existingHashes.keys()) {
       if (!sources.has(source)) {
-        await this.pool.query('DELETE FROM doc_sources WHERE source = $1', [source]);
+        await deleteSource(this.pool, source);
       }
     }
   }
@@ -258,9 +247,6 @@ export class EmbeddingsService {
     return fs.existsSync(this.docsDir);
   }
 
-  /**
-   * Recursively walk a directory tree to find files with a given extension
-   */
   private walkFiles(dir: string, ext: string): string[] {
     let results: string[] = [];
     const entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -285,29 +271,7 @@ export class EmbeddingsService {
     if (texts.length === 0) return [];
 
     const start = Date.now();
-
-    // Batch into one request per BATCH_SIZE inputs instead of one
-    // round-trip per chunk — OpenAI's embeddings endpoint accepts a list of
-    // inputs directly. BATCH_SIZE stays comfortably under OpenAI's
-    // per-request input limit in case a much larger corpus is ever indexed
-    // in one rebuildCache() run.
-    const BATCH_SIZE = 500;
-    const embeddings: number[][] = [];
-    let totalTokens = 0;
-
-    for (let i = 0; i < texts.length; i += BATCH_SIZE) {
-      const batch = texts.slice(i, i + BATCH_SIZE);
-      const resp = await this.openai.embeddings.create({
-        input: batch,
-        model: 'text-embedding-3-small'
-      });
-      totalTokens += resp.usage?.total_tokens ?? 0;
-      // Defensive: the API documents results as index-aligned with the
-      // input batch, but sort explicitly rather than trust array order.
-      for (const item of [...resp.data].sort((a, b) => a.index - b.index)) {
-        embeddings.push(item.embedding);
-      }
-    }
+    const { vectors, totalTokens = 0 } = await this.embeddings.embed(texts);
 
     // Always-on, one-line observability (not gated behind debug, unlike the
     // verbose request/response dumps in llm.ts) — cheap signal for
@@ -315,7 +279,7 @@ export class EmbeddingsService {
     // needing a dedicated metrics backend.
     console.log(`[embeddings] texts=${texts.length} tokens=${totalTokens} ms=${Date.now() - start}`);
 
-    return embeddings;
+    return vectors;
   }
 
   /**
@@ -327,20 +291,12 @@ export class EmbeddingsService {
     }
 
     const queryEmbeddings = await this.embedTexts([queryText]);
-    const queryEmbed = pgvector.toSql(queryEmbeddings[0]);
+    const rows = await vectorSearch(this.pool, queryEmbeddings[0], k);
 
     // Cosine distance (<=>) ranks nearest first; convert to the same
     // "higher is more similar" score the old in-memory cosine similarity
     // produced, since callers of search() (tests, debugging) expect that.
-    const result = await this.pool.query<{ id: string; source: string; content: string; distance: number }>(
-      `SELECT id, source, content, embedding <=> $1 AS distance
-       FROM doc_chunks
-       ORDER BY embedding <=> $1
-       LIMIT $2`,
-      [queryEmbed, k]
-    );
-
-    return result.rows.map((row) => ({
+    return rows.map((row) => ({
       id: row.id,
       score: 1 - row.distance,
       chunk: { source: row.source, content: row.content }
@@ -359,16 +315,9 @@ export class EmbeddingsService {
       throw new Error('Service not initialized. Call initialize() first.');
     }
 
-    const result = await this.pool.query<{ id: string; source: string; content: string; rank: number }>(
-      `SELECT id, source, content, ts_rank(content_tsv, plainto_tsquery('english', $1)) AS rank
-       FROM doc_chunks
-       WHERE content_tsv @@ plainto_tsquery('english', $1)
-       ORDER BY rank DESC
-       LIMIT $2`,
-      [queryText, k]
-    );
+    const rows = await keywordSearchRows(this.pool, queryText, k);
 
-    return result.rows.map((row) => ({
+    return rows.map((row) => ({
       id: row.id,
       score: row.rank,
       chunk: { source: row.source, content: row.content }
@@ -436,10 +385,7 @@ export class EmbeddingsService {
       return { chunkCount: 0, embeddingDim: 0 };
     }
 
-    const result = await this.pool.query<{ count: string }>('SELECT count(*) FROM doc_chunks');
-    const chunkCount = Number(result.rows[0].count);
-    // Fixed dimension of text-embedding-3-small, the only model this
-    // service embeds with — not derived from a stored vector.
-    return { chunkCount, embeddingDim: chunkCount > 0 ? 1536 : 0 };
+    const chunkCount = await getChunkCount(this.pool);
+    return { chunkCount, embeddingDim: chunkCount > 0 ? this.embeddings.dimensions : 0 };
   }
 }

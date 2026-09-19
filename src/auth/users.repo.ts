@@ -9,7 +9,15 @@ export interface User {
   employeeId: string;
 }
 
-function rowToUser(row: any): User {
+interface UserRow {
+  id: string;
+  okta_id: string;
+  email: string;
+  name: string;
+  employee_id: string;
+}
+
+function rowToUser(row: UserRow): User {
   return {
     id: row.id,
     oktaId: row.okta_id,
@@ -25,7 +33,7 @@ export async function findOrCreateUser(profile: OktaProfile): Promise<User> {
   // the same brand-new identity (e.g. a double-submitted OAuth callback)
   // both saw no existing row and both attempted the INSERT — the second
   // would throw an unhandled unique_violation instead of completing login.
-  const result = await query<any>(
+  const result = await query<UserRow>(
     `INSERT INTO users (okta_id, email, name, employee_id)
      VALUES ($1, $2, $3, $4)
      ON CONFLICT (okta_id) DO UPDATE SET
@@ -37,6 +45,6 @@ export async function findOrCreateUser(profile: OktaProfile): Promise<User> {
 }
 
 export async function getUserById(id: string): Promise<User | null> {
-  const result = await query<any>('SELECT * FROM users WHERE id = $1', [id]);
+  const result = await query<UserRow>('SELECT * FROM users WHERE id = $1', [id]);
   return result.rows.length > 0 ? rowToUser(result.rows[0]) : null;
 }

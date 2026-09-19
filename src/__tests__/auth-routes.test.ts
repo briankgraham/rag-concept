@@ -6,6 +6,7 @@ import { createAuthRouter } from '../auth/auth.routes.js';
 import { MockOktaClient, MOCK_EMPLOYEES, encodeMockCode } from '../auth/okta-client.mock.js';
 import { pool } from '../db/pool.js';
 import { errorHandler } from '../middleware/error-handler.js';
+import { config } from '../config.js';
 
 after(async () => {
   await pool.end();
@@ -81,7 +82,14 @@ test('full login flow: login -> mock-login -> callback sets a session cookie', a
     );
 
     assert.equal(callbackRes.status, 302);
-    assert.equal(callbackRes.headers.get('location'), '/');
+    // Post-login redirect goes to the configured frontend origin (its own
+    // dev server or a separate docker service), not a relative '/' on the
+    // API's own origin — see config.frontendUrl / auth.routes.ts callback.
+    // Koa's ctx.redirect() re-stringifies an absolute URL via `new
+    // URL(url).toString()`, which appends a trailing '/' when the config
+    // value has no path — so compare against that same normalization
+    // rather than the raw config string.
+    assert.equal(callbackRes.headers.get('location'), new URL(config.frontendUrl).toString());
     const callbackCookies = cookiePairs(callbackRes);
     assert.ok(callbackCookies.session_token);
     assert.equal(callbackCookies.oauth_state, ''); // cleared

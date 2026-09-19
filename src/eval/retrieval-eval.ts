@@ -30,7 +30,7 @@
  * applied) — same preconditions as eval:tools.
  */
 import path from 'path';
-import OpenAI from 'openai';
+import { createProviders } from '../providers/openai/create-providers.js';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { EmbeddingsService } from '../rag/embeddings.service.js';
@@ -157,12 +157,12 @@ interface EvalResult {
 }
 
 async function main(): Promise<void> {
-  const openai = new OpenAI({ apiKey: config.openaiApiKey });
-  const embeddingsService = new EmbeddingsService(openai, DOCS_DIR, pool);
+  const providers = createProviders(config.openaiApiKey);
+  const embeddingsService = new EmbeddingsService(providers.embeddings, DOCS_DIR, pool);
 
   console.log('Initializing embeddings cache (this makes real OpenAI embedding calls)...');
   await embeddingsService.initialize();
-  const ragService = new RagService(openai, embeddingsService, false);
+  const ragService = new RagService(providers.chat, embeddingsService, false);
 
   const results: EvalResult[] = [];
 

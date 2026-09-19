@@ -3,7 +3,7 @@ import path from 'path';
 import Koa from 'koa';
 import Router from '@koa/router';
 import bodyParser from 'koa-bodyparser';
-import OpenAI from 'openai';
+import { createProviders } from './providers/openai/create-providers.js';
 import { config } from './config.js';
 import { pool } from './db/pool.js';
 import { EmbeddingsService } from './rag/embeddings.service.js';
@@ -29,14 +29,14 @@ async function main(): Promise<void> {
   // Nothing downstream reaches for a module-level singleton — that's what
   // keeps each piece swappable and independently testable. See
   // src/orchestrator/types.ts for the same rule applied to tools.
-  const openai = new OpenAI({ apiKey: config.openaiApiKey });
+  const providers = createProviders(config.openaiApiKey);
 
-  const embeddingsService = new EmbeddingsService(openai, DOCS_DIR, pool);
+  const embeddingsService = new EmbeddingsService(providers.embeddings, DOCS_DIR, pool);
   console.log('Initializing embeddings cache...');
   await embeddingsService.initialize();
   const stats = await embeddingsService.getCacheStats();
   console.log(`Loaded ${stats.chunkCount} chunks (embedding dim: ${stats.embeddingDim})`);
-  const ragService = new RagService(openai, embeddingsService, debug);
+  const ragService = new RagService(providers.chat, embeddingsService, debug);
 
   const adpClient = config.adpMock ? new MockAdpClient() : new RealAdpClient();
   const ptoService = new PtoService(adpClient);
@@ -52,7 +52,7 @@ async function main(): Promise<void> {
   });
 
   const authRouter = createAuthRouter({ oktaClient });
-  const chatRouter = createChatRouter({ openai, ragService, ptoService, debug });
+  const chatRouter = createChatRouter({ chat: providers.chat, ragService, ptoService, debug });
 
   // requestLogger must wrap errorHandler, not the other way around: Koa
   // middleware is an onion, and once an exception propagates out of

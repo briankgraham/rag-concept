@@ -1,5 +1,5 @@
-import type OpenAI from 'openai';
 import type { ZodType } from 'zod';
+import type { ChatProvider } from '../providers/chat-provider.interface.js';
 import type { RagService } from '../rag/rag.service.js';
 import type { PtoService } from '../hr/pto.service.js';
 import type { User } from '../auth/users.repo.js';
@@ -14,7 +14,7 @@ import type { User } from '../auth/users.repo.js';
  */
 export interface ToolContext {
   user: User;
-  openai: OpenAI;
+  chat: ChatProvider;
   ragService: RagService;
   ptoService: PtoService;
   debug: boolean;
@@ -42,7 +42,7 @@ export interface ToolResult {
 
 /**
  * A single capability the orchestrator can invoke. `parameters` is the
- * JSON Schema advertised to the LLM (OpenAI function-calling spec);
+ * JSON Schema advertised to the LLM (JSON Schema function-calling spec);
  * `argsSchema` is the Zod schema used to validate/parse the model's raw
  * arguments before execute() ever sees them, so a malformed tool call
  * fails fast with a clear error fed back to the model instead of a runtime

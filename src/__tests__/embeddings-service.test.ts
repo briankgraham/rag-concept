@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import type OpenAI from 'openai';
+import type { EmbeddingsProvider } from '../providers/embeddings-provider.interface.js';
 import { pool } from '../db/pool.js';
 import { EmbeddingsService } from '../rag/embeddings.service.js';
 
@@ -25,17 +25,15 @@ function vec(...indices: number[]): number[] {
   return v;
 }
 
-function fakeOpenAI(vectorFor: (text: string) => number[], onCall?: (text: string) => void): OpenAI {
+function fakeProvider(vectorFor: (text: string) => number[], onCall?: (text: string) => void): EmbeddingsProvider {
   return {
-    embeddings: {
-      create: ({ input }: { input: string[] }) => {
-        input.forEach((text) => onCall?.(text));
-        return Promise.resolve({
-          data: input.map((text, index) => ({ index, embedding: vectorFor(text) }))
-        });
-      }
+    model: 'fake-embeddings',
+    dimensions: EMBEDDING_DIM,
+    embed: (texts) => {
+      texts.forEach((text) => onCall?.(text));
+      return Promise.resolve({ vectors: texts.map(vectorFor) });
     }
-  } as unknown as OpenAI;
+  };
 }
 
 function tmpDir(): string {
@@ -68,11 +66,11 @@ test('rebuildCache chunks markdown files (recursively), skips non-.md files, and
   );
 
   const calls: string[] = [];
-  const openai = fakeOpenAI(
+  const provider = fakeProvider(
     () => vec(0),
     (text) => calls.push(text)
   );
-  const service = new EmbeddingsService(openai, docsDir, pool);
+  const service = new EmbeddingsService(provider, docsDir, pool);
 
   await service.rebuildCache();
 
@@ -90,7 +88,7 @@ test('chunkText keeps each markdown header together with its own content, in a s
     '## Section A\nContent for section A.\n## Section B\nContent for section B.\n'
   );
 
-  const service = new EmbeddingsService(fakeOpenAI(() => vec(0)), docsDir, pool);
+  const service = new EmbeddingsService(fakeProvider(() => vec(0)), docsDir, pool);
   await service.rebuildCache();
 
   const rows = await pool.query<{ content: string }>(
@@ -115,7 +113,7 @@ test('chunkText splits an oversized section into overlapping token windows', asy
   const words = Array.from({ length: 300 }, (_, i) => `word${String(i).padStart(3, '0')}`);
   fs.writeFileSync(path.join(docsDir, 'long.md'), words.join(' '));
 
-  const service = new EmbeddingsService(fakeOpenAI(() => vec(0)), docsDir, pool);
+  const service = new EmbeddingsService(fakeProvider(() => vec(0)), docsDir, pool);
   await service.rebuildCache();
 
   const rows = await pool.query<{ content: string }>(
@@ -135,16 +133,16 @@ test('chunkText splits an oversized section into overlapping token windows', asy
   assert.ok(rows.rows[1].content.includes('word199')); // end of the overlap
 });
 
-test('rebuildCache is a no-op (no OpenAI calls) when a file has not changed since the last rebuild', async () => {
+test('rebuildCache is a no-op (no embedding calls) when a file has not changed since the last rebuild', async () => {
   const docsDir = tmpDir();
   fs.writeFileSync(path.join(docsDir, 'a.md'), 'hello world');
 
   let calls = 0;
-  const openai = fakeOpenAI(
+  const provider = fakeProvider(
     () => vec(0),
     () => calls++
   );
-  const service = new EmbeddingsService(openai, docsDir, pool);
+  const service = new EmbeddingsService(provider, docsDir, pool);
 
   await service.rebuildCache();
   assert.equal(calls, 1);
@@ -161,11 +159,11 @@ test('rebuildCache re-embeds only a changed file, and removes rows for a deleted
   fs.writeFileSync(fileB, 'bbb');
 
   const calls: string[] = [];
-  const openai = fakeOpenAI(
+  const provider = fakeProvider(
     () => vec(0),
     (text) => calls.push(text)
   );
-  const service = new EmbeddingsService(openai, docsDir, pool);
+  const service = new EmbeddingsService(provider, docsDir, pool);
 
   await service.rebuildCache();
   assert.equal(calls.length, 2);
@@ -190,8 +188,8 @@ test('rebuildCache rolls back a source upsert entirely if an embedding fails to 
 
   // Wrong dimension -> the INSERT into doc_chunks (vector(1536)) fails,
   // which should roll back the doc_sources upsert in the same transaction.
-  const openai = fakeOpenAI(() => [1, 2, 3]);
-  const service = new EmbeddingsService(openai, docsDir, pool);
+  const provider = fakeProvider(() => [1, 2, 3]);
+  const service = new EmbeddingsService(provider, docsDir, pool);
 
   await assert.rejects(() => service.rebuildCache());
 
@@ -199,12 +197,12 @@ test('rebuildCache rolls back a source upsert entirely if an embedding fails to 
   assert.equal(sources.rows.length, 0); // rolled back, not left half-written
 });
 
-test('rebuildCache handles a file with no content (zero chunks) without calling OpenAI for it', async () => {
+test('rebuildCache handles a file with no content (zero chunks) without calling the provider for it', async () => {
   const docsDir = tmpDir();
   fs.writeFileSync(path.join(docsDir, 'empty.md'), '');
 
   let calls = 0;
-  const service = new EmbeddingsService(fakeOpenAI(() => vec(0), () => calls++), docsDir, pool);
+  const service = new EmbeddingsService(fakeProvider(() => vec(0), () => calls++), docsDir, pool);
   await service.rebuildCache();
 
   assert.equal(calls, 0);
@@ -214,8 +212,8 @@ test('rebuildCache handles a file with no content (zero chunks) without calling 
 
 test('rebuildCache stores no chunks when the docs directory does not exist', async () => {
   const docsDir = path.join(tmpDir(), 'does-not-exist');
-  const openai = fakeOpenAI(() => vec(0));
-  const service = new EmbeddingsService(openai, docsDir, pool);
+  const provider = fakeProvider(() => vec(0));
+  const service = new EmbeddingsService(provider, docsDir, pool);
 
   await service.rebuildCache();
   await service.initialize();
@@ -229,11 +227,11 @@ test('initialize() rebuilds when doc_chunks is empty', async () => {
   fs.writeFileSync(path.join(docsDir, 'a.md'), 'hello world');
 
   let embedCalled = false;
-  const openai = fakeOpenAI(() => {
+  const provider = fakeProvider(() => {
     embedCalled = true;
     return vec(0);
   });
-  const service = new EmbeddingsService(openai, docsDir, pool);
+  const service = new EmbeddingsService(provider, docsDir, pool);
   await service.initialize();
 
   assert.equal(embedCalled, true);
@@ -244,18 +242,18 @@ test('initialize() uses existing rows instead of rebuilding when doc_chunks is a
   const docsDir = tmpDir();
   fs.writeFileSync(path.join(docsDir, 'a.md'), 'hello world');
   const seedService = new EmbeddingsService(
-    fakeOpenAI(() => vec(0)),
+    fakeProvider(() => vec(0)),
     docsDir,
     pool
   );
   await seedService.rebuildCache();
 
   let embedCalled = false;
-  const openai = fakeOpenAI(() => {
+  const provider = fakeProvider(() => {
     embedCalled = true;
     return vec(0);
   });
-  const service = new EmbeddingsService(openai, docsDir, pool);
+  const service = new EmbeddingsService(provider, docsDir, pool);
   await service.initialize();
 
   assert.equal(embedCalled, false); // table already had rows, never re-embedded
@@ -264,7 +262,7 @@ test('initialize() uses existing rows instead of rebuilding when doc_chunks is a
 
 test('search() throws if called before initialize()', async () => {
   const service = new EmbeddingsService(
-    fakeOpenAI(() => vec(0)),
+    fakeProvider(() => vec(0)),
     tmpDir(),
     pool
   );
@@ -273,7 +271,7 @@ test('search() throws if called before initialize()', async () => {
 
 test('multiSearch() throws if called before initialize()', async () => {
   const service = new EmbeddingsService(
-    fakeOpenAI(() => vec(0)),
+    fakeProvider(() => vec(0)),
     tmpDir(),
     pool
   );
@@ -290,7 +288,7 @@ test('search() ranks chunks by cosine similarity', async () => {
     if (text === 'banana') return vec(1);
     return vec(0, 1); // query vector
   };
-  const service = new EmbeddingsService(fakeOpenAI(vectorFor), docsDir, pool);
+  const service = new EmbeddingsService(fakeProvider(vectorFor), docsDir, pool);
   await service.initialize();
 
   const results = await service.search('query-for-apple-ish', 2);
@@ -312,7 +310,7 @@ test('multiSearch() dedupes chunks across overlapping queries', async () => {
   fs.writeFileSync(path.join(docsDir, 'b.md'), 'b');
 
   const service = new EmbeddingsService(
-    fakeOpenAI(() => vec(0)),
+    fakeProvider(() => vec(0)),
     docsDir,
     pool
   ); // every embedding identical -> every search returns both chunks
@@ -329,7 +327,7 @@ test('keywordSearch() finds a chunk by exact term even with a dissimilar embeddi
 
   // Every chunk gets the same embedding, so dense search alone can't
   // distinguish them — keywordSearch() has to be doing its own thing.
-  const service = new EmbeddingsService(fakeOpenAI(() => vec(0)), docsDir, pool);
+  const service = new EmbeddingsService(fakeProvider(() => vec(0)), docsDir, pool);
   await service.initialize();
 
   const results = await service.keywordSearch('coworking reimbursement', 5);
@@ -339,7 +337,7 @@ test('keywordSearch() finds a chunk by exact term even with a dissimilar embeddi
 
 test('keywordSearch() throws if called before initialize()', async () => {
   const service = new EmbeddingsService(
-    fakeOpenAI(() => vec(0)),
+    fakeProvider(() => vec(0)),
     tmpDir(),
     pool
   );
@@ -362,7 +360,7 @@ test('multiSearch() surfaces an exact-term match that dense search alone ranks l
     if (text.startsWith('decoy')) return vec(0);
     return vec(0); // query embedding
   };
-  const service = new EmbeddingsService(fakeOpenAI(vectorFor), docsDir, pool);
+  const service = new EmbeddingsService(fakeProvider(vectorFor), docsDir, pool);
   await service.initialize();
 
   const results = await service.multiSearch(['coworking reimbursement cap'], 1);
@@ -372,7 +370,7 @@ test('multiSearch() surfaces an exact-term match that dense search alone ranks l
 
 test('getCacheStats() returns zeros before initialization', async () => {
   const service = new EmbeddingsService(
-    fakeOpenAI(() => vec(0)),
+    fakeProvider(() => vec(0)),
     tmpDir(),
     pool
   );
